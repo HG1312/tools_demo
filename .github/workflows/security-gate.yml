@@ -1,0 +1,180 @@
+# =============================================================================
+#  SECURITY GATE  -  ONE file. Runs on every pull request.
+#
+#  On each pull request, for ALL THREE tools, it:
+#    1. scans (OSV = dependencies, Trivy = image, TruffleHog = secrets)
+#    2. opens a GitHub Issue for each finding  (deduped - no repeats)
+#    3. sets the check red so branch protection can block the merge
+#
+#  JOB 4 (SAST) is included but commented out. Remove its "#" to switch on.
+# =============================================================================
+
+name: Security Gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: security-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ===========================================================================
+  # JOB 1 - SCA: vulnerable dependencies (OSV-Scanner)
+  # ===========================================================================
+  sca:
+    name: SCA (OSV-Scanner)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run OSV-Scanner (JSON, do not fail yet)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" \
+            ghcr.io/google/osv-scanner:v1.9.2 --format json -r /src > osv.json || true
+      - name: Open issues + set red/green
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let data = {};
+            try { data = JSON.parse(fs.readFileSync('osv.json','utf8')); } catch (e) {}
+            let count = 0;
+            for (const r of (data.results || [])) {
+              const src = r.source && r.source.path ? r.source.path.split('/').pop() : 'deps';
+              for (const pkg of (r.packages || [])) {
+                const name = pkg.package.name, version = pkg.package.version;
+                for (const v of (pkg.vulnerabilities || [])) {
+                  count++;
+                  const fp = `fp:osv:${name}:${v.id}`;
+                  const dup = await github.rest.issues.listForRepo({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    state: 'open', labels: fp });
+                  if (dup.data.length > 0) continue;
+                  await github.rest.issues.create({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    title: `[Dependency] ${v.id} in ${name} ${version}`,
+                    body: `Package: ${name} ${version}\nAdvisory: https://osv.dev/${v.id}\n`
+                        + `Source file: ${src}\n\n${v.summary || ''}`,
+                    labels: ['security','dependency',fp] });
+                }
+              }
+            }
+            if (count > 0) core.setFailed(`OSV found ${count} dependency vulnerabilities`);
+
+  # ===========================================================================
+  # JOB 2 - CONTAINER: image vulnerabilities (Trivy)
+  # ===========================================================================
+  container:
+    name: Container Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t app:ci .
+      - name: Trivy (JSON, do not fail yet)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: app:ci
+          format: json
+          output: trivy.json
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          scanners: vuln
+          exit-code: "0"
+      - name: Open issues + set red/green
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let data = {};
+            try { data = JSON.parse(fs.readFileSync('trivy.json','utf8')); } catch (e) {}
+            let count = 0;
+            for (const result of (data.Results || [])) {
+              for (const v of (result.Vulnerabilities || [])) {
+                count++;
+                const fp = `fp:trivy:${v.PkgName}:${v.VulnerabilityID}`;
+                const dup = await github.rest.issues.listForRepo({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  state: 'open', labels: fp });
+                if (dup.data.length > 0) continue;
+                await github.rest.issues.create({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  title: `[Container] ${v.Severity} ${v.VulnerabilityID} in ${v.PkgName}`,
+                  body: `Package: ${v.PkgName} ${v.InstalledVersion}\n`
+                      + `Fixed in: ${v.FixedVersion || 'no fix yet'}\n`
+                      + `${v.PrimaryURL || ''}\n\n${v.Title || ''}`,
+                  labels: ['security','container',v.Severity,fp] });
+              }
+            }
+            if (count > 0) core.setFailed(`Trivy found ${count} image vulnerabilities`);
+
+  # ===========================================================================
+  # JOB 3 - SECRETS: leaked credentials (TruffleHog)
+  # Opens a REDACTED issue per secret (never the secret value). Sets the check
+  # red only if a secret is VERIFIED live; otherwise it warns and logs issues.
+  # We copy the files minus .git first, so the runner's own token is ignored.
+  # ===========================================================================
+  secrets:
+    name: Secret Scan (TruffleHog)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run TruffleHog (JSON)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+          mkdir -p /tmp/scan
+          cp -a . /tmp/scan
+          rm -rf /tmp/scan/.git
+          trufflehog filesystem /tmp/scan --results=verified,unknown,unverified --json --no-update > th.json || true
+      - name: Open issues + set red/green
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let lines = [];
+            try { lines = fs.readFileSync('th.json','utf8').split('\n'); } catch (e) {}
+            let verified = 0, total = 0;
+            for (const line of lines) {
+              const s = line.trim();
+              if (!s.startsWith('{')) continue;
+              let f; try { f = JSON.parse(s); } catch (e) { continue; }
+              if (!f.DetectorName) continue;
+              total++;
+              if (f.Verified) verified++;
+              const meta = f.SourceMetadata && f.SourceMetadata.Data && f.SourceMetadata.Data.Filesystem;
+              let file = meta ? meta.file : 'unknown';
+              file = file.replace('/tmp/scan/','');
+              const fp = `fp:secret:${f.DetectorName}:${file}`;
+              const dup = await github.rest.issues.listForRepo({
+                owner: context.repo.owner, repo: context.repo.repo,
+                state: 'open', labels: fp });
+              if (dup.data.length > 0) continue;
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `[Secret] ${f.DetectorName} in ${file}${f.Verified ? ' (VERIFIED LIVE)' : ''}`,
+                body: `A potential ${f.DetectorName} secret was detected.\nFile: ${file}\n`
+                    + `Verified live: ${f.Verified}\n\n`
+                    + `The secret value is intentionally NOT shown here. Remove it from the file and rotate it.`,
+                labels: ['security','secret',fp] });
+            }
+            if (verified > 0) core.setFailed(`TruffleHog found ${verified} VERIFIED live secret(s)`);
+            else if (total > 0) core.warning(`${total} potential secret(s) logged as issues (none verified live)`);
+
+  # ===========================================================================
+  # JOB 4 - SAST: deep code scan.  [OFF]  Remove the "#" marks to switch on.
+  # The current 3 tools do NOT scan your app code logic - that is SAST's job.
+  # ===========================================================================
+  # sast:
+  #   name: SAST (code scan)
+  #   runs-on: ubuntu-latest
+  #   container:
+  #     image: semgrep/semgrep
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: semgrep scan --config=p/python --config=p/javascript --error
